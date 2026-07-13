@@ -42,7 +42,9 @@
 # Per-client files (all beside the script, or under $ROOT if you override it):
 #   clients/<name>.env   client config: CLIENT_NAME, optional ROOT / TRACE_ANCHOR /
 #                        EXPECTED_SRC_CIDR / TCP_HOTSPOTS[] / HTTPS_HOTSPOTS[]
-#   cde-all.txt          cardholder IPs, one per line (the CDE target list)
+#   cde-all.txt          CDE targets, one per line: single IPs, CIDR blocks
+#                        (192.168.1.0/24), or octet ranges (192.168.1.10-20).
+#                        '#' comments and blank lines are ignored.
 #   evidence/            results — one timestamped folder per VLAN run, plus a
 #                        .tar.gz + .sha256 of each run for tamper-evident evidence
 #
@@ -173,6 +175,25 @@ install_deps() {
   return 1
 }
 
+# Emit clean CDE target specs from a list file, one per line: strip '#' comments
+# (full-line and inline), split whitespace-separated targets, drop blank lines.
+# Each surviving token is a valid nmap target: single IP, CIDR, or octet range.
+cde_specs() {
+  sed 's/#.*//' "$1" 2>/dev/null | tr -s '[:space:]' '\n' | grep -E '.'
+}
+
+# Warn (do not fail) on any spec that doesn't look like an IPv4 / CIDR / octet range,
+# e.g. a fat-fingered "192.168.1.0/240" — nmap would still error, but flag it early.
+warn_bad_specs() {
+  local re='^([0-9]{1,3}(-[0-9]{1,3})?\.){3}[0-9]{1,3}(-[0-9]{1,3})?(/[0-9]{1,2})?$'
+  local spec bad=""
+  while IFS= read -r spec; do
+    [[ "$spec" =~ $re ]] || bad="$bad $spec"
+  done < <(cde_specs "$1")
+  [[ -n "$bad" ]] && echo "WARNING: these CDE entries don't look like IPv4/CIDR/range:$bad" >&2
+  return 0
+}
+
 # Pure-bash IPv4-in-CIDR test. Returns 0 if $1 is inside CIDR $2, 1 otherwise.
 ip_to_int() {
   local a b c d
@@ -253,11 +274,16 @@ do_init() {
     cde_state="already present (left untouched)"
   else
     cat > "$cde" <<'EOF'
-# cde-all.txt — cardholder (CDE) IPs, ONE PER LINE. Lines starting with # are ignored.
-# Fill this in for the current client, then run the scan per source VLAN.
-# Example:
+# cde-all.txt — cardholder (CDE) targets. Each line/entry can be:
+#   - a single IP        192.168.1.5
+#   - a CIDR block       192.168.1.0/24
+#   - an octet range     192.168.1.10-20   or   192.168.1-3.1-254
+# One entry per line. '#' starts a comment (whole-line or inline). Blank lines ignored.
+# nmap expands CIDRs/ranges automatically. Fill in for THIS client, then scan per VLAN.
+# Examples (delete and replace):
 # 10.20.30.5
-# 10.20.30.6
+# 10.20.30.0/24
+# 10.20.31.10-40
 EOF
   fi
 
@@ -379,10 +405,9 @@ if [[ -n "$EXPECTED_SRC_CIDR" && ! "$EXPECTED_SRC_CIDR" == */* ]]; then
   exit 1
 fi
 
-# Soft target count for display (dry-run runs before the hard prereq checks).
-# grep -c prints "0" and exits non-zero on no match, so neutralise the exit and
-# default an empty result (missing file) to 0 — never chain a second `echo 0`.
-CDE_COUNT=$(grep -cE '^[0-9]' "$CDE_LIST" 2>/dev/null || true); CDE_COUNT=${CDE_COUNT:-0}
+# Soft target-spec count for display (dry-run runs before the hard prereq checks).
+# Counts target SPECS (IPs/CIDRs/ranges), not expanded hosts — a /24 counts as 1.
+CDE_COUNT=$(cde_specs "$CDE_LIST" 2>/dev/null | grep -cE '.' || true); CDE_COUNT=${CDE_COUNT:-0}
 
 # -------------------------------------------------------------------- dry-run preview
 
@@ -392,20 +417,21 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "============================================================"
   echo " Client cfg:   $CLIENT_ENV"
   echo " ROOT:         $ROOT"
-  echo " CDE list:     $CDE_LIST  ($CDE_COUNT IP[s])"
+  echo " CDE list:     $CDE_LIST  ($CDE_COUNT target spec[s]: IPs / CIDRs / ranges)"
   echo " Anchor:       ${TRACE_ANCHOR:-(none — baseline traceroute skipped)}"
   echo " Src guard:    ${EXPECTED_SRC_CIDR:-(none — manual 5s source-IP eyeball only)}"
   echo " Hot-spots:    ${#TCP_HOTSPOTS[@]} TCP group(s), ${#HTTPS_HOTSPOTS[@]} HTTPS group(s)"
   echo " Evidence ->   $ROOT/evidence/${SOURCE_SEGMENT}-<timestamp>/  (+ .tar.gz + .sha256)"
   echo
-  echo " Would run against each CDE IP:"
+  echo " Would run against every CDE target (nmap expands CIDRs/ranges):"
   echo "   - host discovery : nmap -sn (with and without -Pn)"
   echo "   - TCP common     : -p $TCP_COMMON_PORTS"
   echo "   - TCP full       : $([[ $FULL_TCP -eq 1 ]] && echo 'yes  (-p-  --max-rate 500)' || echo 'no  (pass --full-tcp)')"
   echo "   - UDP            : $([[ $SKIP_UDP -eq 1 ]] && echo 'skipped (--skip-udp)' || echo "-p $UDP_PORTS")"
   echo
-  echo " CDE targets:"
-  grep -E '^[0-9]' "$CDE_LIST" 2>/dev/null | sed 's/^/     /' || echo "     (no list at $CDE_LIST)"
+  echo " CDE target specs (comments/blanks stripped):"
+  cde_specs "$CDE_LIST" 2>/dev/null | sed 's/^/     /' || echo "     (no list at $CDE_LIST)"
+  warn_bad_specs "$CDE_LIST"
   echo "============================================================"
   echo " No evidence written. Remove --dry-run to execute for real (needs sudo)."
   exit 0
@@ -432,8 +458,9 @@ fi
   exit 1
 }
 
-CDE_COUNT=$(grep -cE '^[0-9]' "$CDE_LIST" || true)
-[[ "$CDE_COUNT" -gt 0 ]] || { echo "ERROR: $CDE_LIST is empty" >&2; exit 1; }
+CDE_COUNT=$(cde_specs "$CDE_LIST" | grep -cE '.' || true)
+[[ "$CDE_COUNT" -gt 0 ]] || { echo "ERROR: $CDE_LIST has no target specs (only comments/blanks?)" >&2; exit 1; }
+warn_bad_specs "$CDE_LIST"
 
 # -------------------------------------------------------------------- setup
 
@@ -444,11 +471,16 @@ mkdir -p "$OUTDIR"/{baseline,nmap,manual,pcap,screenshots}
 LOG="$OUTDIR/run.log"
 exec > >(tee -a "$LOG") 2>&1
 
+# Sanitize the human-editable CDE list into a clean nmap target file: comments and
+# blanks stripped, CIDRs/ranges preserved. This is also the exact scope record.
+CDE_CLEAN="$OUTDIR/baseline/cde-targets.clean.txt"
+cde_specs "$CDE_LIST" > "$CDE_CLEAN"
+
 echo "============================================================"
 echo " $CLIENT_NAME Segmentation Test — source: $SOURCE_SEGMENT"
 echo " Client cfg:   $CLIENT_ENV"
 echo " Evidence dir: $OUTDIR"
-echo " CDE targets:  $CDE_COUNT IPs"
+echo " CDE targets:  $CDE_COUNT target spec(s) [IPs/CIDRs/ranges] -> nmap expands them"
 echo " Src guard:    ${EXPECTED_SRC_CIDR:-(none — manual eyeball only)}"
 echo " Hot-spots:    ${#TCP_HOTSPOTS[@]} TCP group(s), ${#HTTPS_HOTSPOTS[@]} HTTPS group(s)"
 echo " Full TCP:     $([[ $FULL_TCP -eq 1 ]] && echo yes || echo no)"
@@ -466,7 +498,8 @@ HOSTNAME: $(hostname)
 USER: ${SUDO_USER:-$USER}
 ARGS: $0 --client $CLIENT $SOURCE_SEGMENT $([[ $FULL_TCP -eq 1 ]] && echo --full-tcp) $([[ $SKIP_UDP -eq 1 ]] && echo --skip-udp) $([[ -n "$EXPECTED_SRC_CIDR" ]] && echo --expect-cidr "$EXPECTED_SRC_CIDR")
 CDE_LIST: $CDE_LIST
-CDE_COUNT: $CDE_COUNT
+CDE_CLEAN: $CDE_CLEAN
+CDE_SPEC_COUNT: $CDE_COUNT
 TRACE_ANCHOR: ${TRACE_ANCHOR:-(none)}
 EXPECTED_SRC_CIDR: ${EXPECTED_SRC_CIDR:-(none)}
 TCP_COMMON_PORTS: $TCP_COMMON_PORTS
@@ -523,14 +556,14 @@ fi
 
 echo
 echo "--- [2/6] Host discovery ---"
-nmap -sn  -n -iL "$CDE_LIST" --reason -oA "$OUTDIR/nmap/01-host-discovery"
-nmap -Pn -sn -n -iL "$CDE_LIST" --reason -oA "$OUTDIR/nmap/01-host-discovery-pn"
+nmap -sn  -n -iL "$CDE_CLEAN" --reason -oA "$OUTDIR/nmap/01-host-discovery"
+nmap -Pn -sn -n -iL "$CDE_CLEAN" --reason -oA "$OUTDIR/nmap/01-host-discovery-pn"
 
 # -------------------------------------------------------------------- 3. TCP common
 
 echo
 echo "--- [3/6] TCP common-ports scan ---"
-nmap -Pn -n -sS -iL "$CDE_LIST" \
+nmap -Pn -n -sS -iL "$CDE_CLEAN" \
   -p "$TCP_COMMON_PORTS" \
   --reason --open \
   -oA "$OUTDIR/nmap/02-tcp-common"
@@ -540,7 +573,7 @@ nmap -Pn -n -sS -iL "$CDE_LIST" \
 if [[ $FULL_TCP -eq 1 ]]; then
   echo
   echo "--- [4/6] TCP full-port scan (rate-limited) ---"
-  nmap -Pn -n -sS -iL "$CDE_LIST" -p- --max-rate 500 --reason \
+  nmap -Pn -n -sS -iL "$CDE_CLEAN" -p- --max-rate 500 --reason \
     -oA "$OUTDIR/nmap/03-tcp-full"
 else
   echo
@@ -552,7 +585,7 @@ fi
 if [[ $SKIP_UDP -eq 0 ]]; then
   echo
   echo "--- [5/6] UDP selected-ports scan ---"
-  nmap -Pn -n -sU -iL "$CDE_LIST" -p "$UDP_PORTS" --reason \
+  nmap -Pn -n -sU -iL "$CDE_CLEAN" -p "$UDP_PORTS" --reason \
     -oA "$OUTDIR/nmap/04-udp-selected"
 else
   echo
