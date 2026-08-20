@@ -34,9 +34,9 @@
 #
 # Examples:
 #   ./seg-test.sh --check
-#   ./seg-test.sh --init miskpay
-#   sudo ./seg-test.sh --client miskpay VLAN_44
-#   sudo ./seg-test.sh --client miskpay VLAN_44 --expect-cidr 10.20.44.0/24
+#   ./seg-test.sh --init client-name
+#   sudo ./seg-test.sh --client client-name VLAN_44
+#   sudo ./seg-test.sh --client client-name VLAN_44 --expect-cidr 10.20.44.0/24
 #   sudo ./seg-test.sh --client trustbank VLAN_41_Compliance --full-tcp
 #
 # Per-client files (all beside the script, or under $ROOT if you override it):
